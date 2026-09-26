@@ -45,7 +45,8 @@ The exe is not code-signed, so SmartScreen will warn the first time you run it
 
 ## Building
 
-Requires the Rust toolchain (1.80 or newer) with the MSVC target.
+Requires the Rust toolchain (1.80 or newer). Releases are built with the MSVC toolchain
+(`x86_64-pc-windows-msvc`); the GNU toolchain (`x86_64-pc-windows-gnu`) also builds and passes the tests.
 
 ```
 cargo build --release
