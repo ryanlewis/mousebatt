@@ -12,7 +12,7 @@ rust-version = "1.80"
 publish = false
 
 [dependencies.windows-sys]
-version = "0.59"
+version = "=0.59.0"
 features = [
     "Win32_Foundation",
     "Win32_Security",
