@@ -10,18 +10,26 @@ mod hid;
 mod icon;
 mod protocol;
 
-use std::cell::RefCell;
-use std::mem::zeroed;
+use std::cell::{Cell, RefCell};
+use std::ffi::c_void;
+use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
-use icon::Hicon;
+use icon::{BatteryGlyph, Hicon};
 use protocol::{read_battery, set_polling, BatteryStatus, ReadResult};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
+    RegCloseKey, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
+    RRF_RT_REG_DWORD,
+};
+use windows_sys::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+use windows_sys::Win32::UI::Input::{
+    RAWINPUTDEVICE, RIDEV_INPUTSINK, RegisterRawInputDevices,
 };
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -41,21 +49,33 @@ const DEBOUNCE_MS: u32 = 2500; // one replug fires many WM_DEVICECHANGE broadcas
 
 const WMAPP_TRAY: u32 = WM_APP + 1;
 const WMAPP_POLLDONE: u32 = WM_APP + 2;
+const WMAPP_REDRAW: u32 = WM_APP + 3;
 const TIMER_POLL: usize = 1;
 const TIMER_DEBOUNCE: usize = 2;
+const TIMER_THEME: usize = 3;
 const MENU_REFRESH: usize = 1;
 const MENU_AUTOSTART: usize = 2;
 const MENU_EXIT: usize = 3;
 /// Polling-rate items are `MENU_RATE_BASE + index into PollingInfo::rates`.
 const MENU_RATE_BASE: usize = 100;
+/// Battery-icon items are `MENU_GLYPH_BASE + index into BatteryGlyph::ALL`.
+const MENU_GLYPH_BASE: usize = 200;
 
 // Not re-exported cleanly by windows-sys; values are stable Win32 ABI.
 const WM_DEVICECHANGE: u32 = 0x0219;
 const DBT_DEVNODES_CHANGED: usize = 0x0007;
 const WM_POWERBROADCAST: u32 = 0x0218;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+const WM_SETTINGCHANGE: u32 = 0x001A;
+const WM_DPICHANGED: u32 = 0x02E0;
+const WM_INPUT: u32 = 0x00FF;
 
 static POLLING: AtomicBool = AtomicBool::new(false);
+/// The tray is not showing a fresh reading (no mouse, or the mouse is asleep
+/// and not answering). A mouse move while stale re-polls instantly — the
+/// first event after the mouse wakes from its own sleep is a move, and it
+/// also arrives right after a system wake, once the USB stack is up.
+static STALE: AtomicBool = AtomicBool::new(true);
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 /// Polling rate the user picked from the menu, applied by the next poll
 /// thread before it reads the battery (0 = nothing pending).
@@ -65,6 +85,10 @@ static REQUESTED_HZ: AtomicU16 = AtomicU16::new(0);
 thread_local! {
     static LAST_GOOD: RefCell<Option<BatteryStatus>> = const { RefCell::new(None) };
     static CUR_ICON: RefCell<Option<Hicon>> = const { RefCell::new(None) };
+    /// What the icon last showed, to redraw it when a display setting changes.
+    static LAST_VIEW: RefCell<Option<TrayView>> = const { RefCell::new(None) };
+    /// The user's battery-icon choice; loaded from the registry in `main`.
+    static GLYPH: Cell<BatteryGlyph> = const { Cell::new(DEFAULT_GLYPH) };
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -72,6 +96,11 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 fn main() {
+    // DPI aware, so the icon is drawn at the tray's real pixel size rather than
+    // at 96 DPI and blurred by Windows' upscaling on scaled displays.
+    // SAFETY: no preconditions; called before any window exists.
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    GLYPH.with(|g| g.set(load_glyph()));
     let class_name = wide("mousebatt_tray_wnd");
     // SAFETY: WNDCLASSW is plain data for which all-zero is valid; `class_name`
     // outlives the window (it lives until `main` returns), and the other
@@ -127,15 +156,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             update_tray(hwnd, "…", icon::COLOR_STALE, "mousebatt — reading…", true);
             // SAFETY: plain handle + id arguments; no callback pointer.
             unsafe { SetTimer(hwnd, TIMER_POLL, POLL_INTERVAL_MS, None) };
+            // Raw mouse events for instant wake-up detection (see WM_INPUT
+            // below): the window receives WM_INPUT on mouse moves even while
+            // inactive. Best effort — the 4-minute poll covers a failure.
+            let rid = RAWINPUTDEVICE {
+                usUsagePage: 0x01, // generic desktop
+                usUsage: 0x02,     // mouse
+                dwFlags: RIDEV_INPUTSINK, // deliver even while the window is inactive
+                hwndTarget: hwnd,
+            };
+            // SAFETY: `rid` is fully initialised and `size_of` matches.
+            unsafe { RegisterRawInputDevices(&rid, 1, size_of::<RAWINPUTDEVICE>() as u32) };
             start_poll(hwnd);
             0
         }
         WM_TIMER => {
-            if wparam == TIMER_DEBOUNCE {
+            if wparam == TIMER_POLL {
+                // Periodic heartbeat. This is what re-discovers a mouse that
+                // slept (and woke) while the system stayed up: no
+                // WM_DEVICECHANGE or power broadcast is sent for that, so
+                // without this the tray would sit stale until a manual
+                // refresh.
+                start_poll(hwnd);
+            } else if wparam == TIMER_DEBOUNCE {
                 // SAFETY: plain handle + id arguments.
                 unsafe { KillTimer(hwnd, TIMER_DEBOUNCE) };
+                start_poll(hwnd);
+            } else if wparam == TIMER_THEME {
+                // SAFETY: plain handle + id arguments.
+                unsafe { KillTimer(hwnd, TIMER_THEME) };
+                redraw_worker(hwnd);
             }
-            start_poll(hwnd);
             0
         }
         WM_DEVICECHANGE => {
@@ -152,12 +203,60 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             0
         }
+        WM_INPUT => {
+            // A mouse moved. If the tray is stale, the mouse just woke (from
+            // its own sleep, or the system's — its first reports arrive only
+            // once the device is up), so poll now instead of waiting for the
+            // next tick. `STALE` makes this a no-op while a fresh reading is
+            // on display, so the hot path is one atomic read. The data is
+            // deliberately not fetched: the event itself, not its contents,
+            // is the trigger.
+            if STALE.load(Ordering::Relaxed) {
+                start_poll(hwnd);
+            }
+            0
+        }
+        WM_SETTINGCHANGE => {
+            // Light/dark switch: re-read so the icon is redrawn in the matching palette.
+            if lparam != 0 {
+                let p = lparam as *const u16;
+                // SAFETY: a non-null lparam of WM_SETTINGCHANGE is a
+                // null-terminated wide string; `all` stops at the first
+                // mismatch, so it never reads past the terminator.
+                let theme = wide("ImmersiveColorSet")
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &c)| unsafe { *p.add(i) } == c);
+                if theme {
+                    // A fresh taskbar colour and a redraw of the last view are
+                    // all a theme switch needs, so it gets its own path instead
+                    // of a mouse poll (which would be dropped while one is in
+                    // flight). This also stops every accent-colour broadcast
+                    // from HID-polling the mouse.
+                    // SAFETY: plain handle + id arguments; no callback pointer.
+                    unsafe { SetTimer(hwnd, TIMER_THEME, 300, None) };
+                }
+            }
+            0
+        }
+        WM_DPICHANGED => {
+            // The tray's scale changed (a monitor's was, or the taskbar moved
+            // to one with a different scale); render at the new size.
+            redraw_worker(hwnd);
+            0
+        }
         WMAPP_POLLDONE => {
             // SAFETY: WMAPP_POLLDONE is only ever posted by `start_poll` with
             // `lparam` = a `Box<ReadResult>` leaked via `Box::into_raw`; this is
             // the single place that reclaims it, so it is freed exactly once.
             let result = unsafe { *Box::from_raw(lparam as *mut ReadResult) };
             on_poll_done(hwnd, result);
+            0
+        }
+        WMAPP_REDRAW => {
+            // Redrawn with the last reading, in the palette the worker just
+            // read off the taskbar.
+            redraw_tray(hwnd);
             0
         }
         WMAPP_TRAY => match (lparam & 0xffff) as u32 {
@@ -212,6 +311,24 @@ fn start_poll(hwnd: HWND) {
             drop(unsafe { Box::from_raw(result) });
         }
         POLLING.store(false, Ordering::SeqCst);
+        // The taskbar colour is refreshed only after the result is posted: a
+        // screen read can stall (fullscreen transitions, the lock screen) and
+        // must never gate the battery read, and a failed read can cost the
+        // colour but not the poll.
+        icon::refresh_taskbar_color();
+    });
+}
+
+/// Re-read the taskbar colour off-screen and redraw what the icon last
+/// showed. `refresh_taskbar_color` goes through the screen DC, so it runs on
+/// a worker, and the redraw is posted back to the UI thread.
+fn redraw_worker(hwnd: HWND) {
+    let hwnd_addr = hwnd as usize;
+    std::thread::spawn(move || {
+        icon::refresh_taskbar_color();
+        // SAFETY: WMAPP_REDRAW carries no payload and `wndproc` ignores both
+        // parameters.
+        unsafe { PostMessageW(hwnd_addr as HWND, WMAPP_REDRAW, 0, 0) };
     });
 }
 
@@ -219,6 +336,9 @@ fn on_poll_done(hwnd: HWND, result: ReadResult) {
     let last_pct = LAST_GOOD.with(|g| g.borrow().as_ref().map(|s| s.percent));
     let view = tray_view(&result, last_pct);
     update_tray(hwnd, &view.text, view.color, &view.tip, false);
+    // Fresh readings clear the stale flag; failures (or a missing mouse) set
+    // it so the next mouse move re-polls instantly (see WM_INPUT).
+    let fresh = matches!(result, ReadResult::Ok(_));
     match result {
         ReadResult::Ok(s) => LAST_GOOD.with(|g| *g.borrow_mut() = Some(s)),
         // Forget the last reading so a different mouse plugged in later
@@ -226,6 +346,7 @@ fn on_poll_done(hwnd: HWND, result: ReadResult) {
         ReadResult::NoDevice => LAST_GOOD.with(|g| *g.borrow_mut() = None),
         ReadResult::NoResponse(_) => {}
     }
+    STALE.store(!fresh, Ordering::Relaxed);
     // A rate picked while this poll was in flight is still waiting.
     if REQUESTED_HZ.load(Ordering::SeqCst) != 0 {
         start_poll(hwnd);
@@ -233,6 +354,7 @@ fn on_poll_done(hwnd: HWND, result: ReadResult) {
 }
 
 /// What the tray should show for a poll result (pure; unit-tested).
+#[derive(Clone)]
 struct TrayView {
     text: String,
     color: u32,
@@ -295,7 +417,14 @@ fn base_nid(hwnd: HWND) -> NOTIFYICONDATAW {
 }
 
 fn update_tray(hwnd: HWND, text: &str, color: u32, tip: &str, add: bool) {
-    let new_icon = icon::battery_icon(text, color);
+    let new_icon = icon::battery_icon(text, color, GLYPH.with(Cell::get));
+    LAST_VIEW.with(|v| {
+        *v.borrow_mut() = Some(TrayView {
+            text: text.into(),
+            color,
+            tip: tip.into(),
+        })
+    });
     let mut nid = base_nid(hwnd);
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WMAPP_TRAY;
@@ -316,6 +445,14 @@ fn update_tray(hwnd: HWND, text: &str, color: u32, tip: &str, add: bool) {
     CUR_ICON.with(|c| *c.borrow_mut() = Some(new_icon));
 }
 
+/// Redraw the icon with what it last showed, e.g. after a display setting
+/// changed, without waiting for the mouse.
+fn redraw_tray(hwnd: HWND) {
+    if let Some(v) = LAST_VIEW.with(|v| v.borrow().clone()) {
+        update_tray(hwnd, &v.text, v.color, &v.tip, false);
+    }
+}
+
 fn remove_tray(hwnd: HWND) {
     let nid = base_nid(hwnd);
     // SAFETY: `nid` is fully initialised with cbSize set.
@@ -324,6 +461,7 @@ fn remove_tray(hwnd: HWND) {
 
 fn show_menu(hwnd: HWND) {
     let autostart = autostart_enabled();
+    let glyph = GLYPH.with(Cell::get);
     let polling = LAST_GOOD.with(|g| g.borrow().as_ref().and_then(|s| s.polling));
     let mut pt = POINT { x: 0, y: 0 };
     // SAFETY: the menu (and the submenu it owns) is created and destroyed
@@ -350,6 +488,21 @@ fn show_menu(hwnd: HWND) {
             // DestroyMenu(menu) below also destroys the attached submenu.
             AppendMenuW(menu, MF_POPUP, sub as usize, wide("Polling rate").as_ptr());
         }
+        let icon_sub = CreatePopupMenu();
+        for (i, g) in BatteryGlyph::ALL.into_iter().enumerate() {
+            AppendMenuW(
+                icon_sub,
+                MF_STRING | if g == glyph { MF_CHECKED } else { 0 },
+                MENU_GLYPH_BASE + i,
+                wide(glyph_label(g)).as_ptr(),
+            );
+        }
+        AppendMenuW(
+            menu,
+            MF_POPUP,
+            icon_sub as usize,
+            wide("Battery icon").as_ptr(),
+        );
         AppendMenuW(
             menu,
             MF_STRING | if autostart { MF_CHECKED } else { 0 },
@@ -382,7 +535,14 @@ fn show_menu(hwnd: HWND) {
             unsafe { PostQuitMessage(0) };
         }
         id => {
-            if let Some(&hz) = id
+            if let Some(&g) = id
+                .checked_sub(MENU_GLYPH_BASE)
+                .and_then(|i| BatteryGlyph::ALL.get(i))
+            {
+                GLYPH.with(|c| c.set(g));
+                save_glyph(g);
+                redraw_tray(hwnd);
+            } else if let Some(&hz) = id
                 .checked_sub(MENU_RATE_BASE)
                 .and_then(|i| polling?.rates.get(i))
             {
@@ -390,6 +550,76 @@ fn show_menu(hwnd: HWND) {
                 start_poll(hwnd);
             }
         }
+    }
+}
+
+fn glyph_label(g: BatteryGlyph) -> &'static str {
+    match g {
+        BatteryGlyph::Hidden => "Hidden",
+        BatteryGlyph::Above => "Above the number",
+        BatteryGlyph::Below => "Below the number",
+    }
+}
+
+const SETTINGS_KEY: &str = "Software\\mousebatt";
+const GLYPH_VALUE: &str = "BatteryGlyph";
+/// Used until the user picks another from the menu: the plain number, as
+/// before the glyph existed.
+const DEFAULT_GLYPH: BatteryGlyph = BatteryGlyph::Hidden;
+
+/// The REG_DWORD stored for a battery-icon choice.
+fn glyph_setting(g: BatteryGlyph) -> u32 {
+    match g {
+        BatteryGlyph::Hidden => 0,
+        BatteryGlyph::Above => 1,
+        BatteryGlyph::Below => 2,
+    }
+}
+
+fn glyph_from_setting(value: u32) -> Option<BatteryGlyph> {
+    BatteryGlyph::ALL
+        .into_iter()
+        .find(|&g| glyph_setting(g) == value)
+}
+
+/// The saved battery-icon choice, or the default if none (or an unknown one)
+/// is stored.
+fn load_glyph() -> BatteryGlyph {
+    let mut data: u32 = 0;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: the name temporaries live for the full statement, and
+    // `data`/`size` describe a writable 4-byte buffer for a REG_DWORD.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide(SETTINGS_KEY).as_ptr(),
+            wide(GLYPH_VALUE).as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            &mut data as *mut u32 as *mut c_void,
+            &mut size,
+        )
+    };
+    if rc == 0 {
+        glyph_from_setting(data).unwrap_or(DEFAULT_GLYPH)
+    } else {
+        DEFAULT_GLYPH
+    }
+}
+
+fn save_glyph(g: BatteryGlyph) {
+    let data = glyph_setting(g);
+    // SAFETY: the name temporaries live for the full statement, and `data` is
+    // a 4-byte REG_DWORD that is copied. The key is created if missing.
+    unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            wide(SETTINGS_KEY).as_ptr(),
+            wide(GLYPH_VALUE).as_ptr(),
+            REG_DWORD,
+            &data as *const u32 as *const c_void,
+            size_of::<u32>() as u32,
+        );
     }
 }
 
@@ -536,6 +766,16 @@ mod tests {
         let v = tray_view(&ReadResult::NoResponse("X3".into()), None);
         assert_eq!(v.text, "?");
         assert_eq!(v.tip, "X3 — not responding (asleep?)");
+    }
+
+    #[test]
+    fn glyph_setting_round_trips_and_ignores_unknown_values() {
+        for g in BatteryGlyph::ALL {
+            assert_eq!(glyph_from_setting(glyph_setting(g)), Some(g));
+        }
+        let stored: Vec<u32> = BatteryGlyph::ALL.into_iter().map(glyph_setting).collect();
+        assert_eq!(stored, [0, 1, 2], "stored values must stay stable");
+        assert_eq!(glyph_from_setting(3), None);
     }
 
     #[test]
