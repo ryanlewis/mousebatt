@@ -28,9 +28,6 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows_sys::Win32::UI::Input::{
-    RAWINPUTDEVICE, RIDEV_INPUTSINK, RegisterRawInputDevices,
-};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
@@ -68,14 +65,8 @@ const WM_POWERBROADCAST: u32 = 0x0218;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 const WM_SETTINGCHANGE: u32 = 0x001A;
 const WM_DPICHANGED: u32 = 0x02E0;
-const WM_INPUT: u32 = 0x00FF;
 
 static POLLING: AtomicBool = AtomicBool::new(false);
-/// The tray is not showing a fresh reading (no mouse, or the mouse is asleep
-/// and not answering). A mouse move while stale re-polls instantly — the
-/// first event after the mouse wakes from its own sleep is a move, and it
-/// also arrives right after a system wake, once the USB stack is up.
-static STALE: AtomicBool = AtomicBool::new(true);
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 /// Polling rate the user picked from the menu, applied by the next poll
 /// thread before it reads the battery (0 = nothing pending).
@@ -156,17 +147,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             update_tray(hwnd, "…", icon::COLOR_STALE, "mousebatt — reading…", true);
             // SAFETY: plain handle + id arguments; no callback pointer.
             unsafe { SetTimer(hwnd, TIMER_POLL, POLL_INTERVAL_MS, None) };
-            // Raw mouse events for instant wake-up detection (see WM_INPUT
-            // below): the window receives WM_INPUT on mouse moves even while
-            // inactive. Best effort — the 4-minute poll covers a failure.
-            let rid = RAWINPUTDEVICE {
-                usUsagePage: 0x01, // generic desktop
-                usUsage: 0x02,     // mouse
-                dwFlags: RIDEV_INPUTSINK, // deliver even while the window is inactive
-                hwndTarget: hwnd,
-            };
-            // SAFETY: `rid` is fully initialised and `size_of` matches.
-            unsafe { RegisterRawInputDevices(&rid, 1, size_of::<RAWINPUTDEVICE>() as u32) };
             start_poll(hwnd);
             0
         }
@@ -200,19 +180,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if wparam == PBT_APMRESUMEAUTOMATIC {
                 // SAFETY: plain handle + id arguments; no callback pointer.
                 unsafe { SetTimer(hwnd, TIMER_DEBOUNCE, 5000, None) };
-            }
-            0
-        }
-        WM_INPUT => {
-            // A mouse moved. If the tray is stale, the mouse just woke (from
-            // its own sleep, or the system's — its first reports arrive only
-            // once the device is up), so poll now instead of waiting for the
-            // next tick. `STALE` makes this a no-op while a fresh reading is
-            // on display, so the hot path is one atomic read. The data is
-            // deliberately not fetched: the event itself, not its contents,
-            // is the trigger.
-            if STALE.load(Ordering::Relaxed) {
-                start_poll(hwnd);
             }
             0
         }
@@ -336,9 +303,6 @@ fn on_poll_done(hwnd: HWND, result: ReadResult) {
     let last_pct = LAST_GOOD.with(|g| g.borrow().as_ref().map(|s| s.percent));
     let view = tray_view(&result, last_pct);
     update_tray(hwnd, &view.text, view.color, &view.tip, false);
-    // Fresh readings clear the stale flag; failures (or a missing mouse) set
-    // it so the next mouse move re-polls instantly (see WM_INPUT).
-    let fresh = matches!(result, ReadResult::Ok(_));
     match result {
         ReadResult::Ok(s) => LAST_GOOD.with(|g| *g.borrow_mut() = Some(s)),
         // Forget the last reading so a different mouse plugged in later
@@ -346,7 +310,6 @@ fn on_poll_done(hwnd: HWND, result: ReadResult) {
         ReadResult::NoDevice => LAST_GOOD.with(|g| *g.borrow_mut() = None),
         ReadResult::NoResponse(_) => {}
     }
-    STALE.store(!fresh, Ordering::Relaxed);
     // A rate picked while this poll was in flight is still waiting.
     if REQUESTED_HZ.load(Ordering::SeqCst) != 0 {
         start_poll(hwnd);
