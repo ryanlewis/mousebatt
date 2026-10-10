@@ -23,9 +23,15 @@ since devices are matched by vendor ID + HID usage page rather than specific pro
 
 - Polls the mouse every 4 minutes over the vendor HID interface
 - Re-reads immediately when a USB device is plugged/unplugged (debounced) and on resume from sleep
-- Icon text color: white = normal, green = charging, red = ≤20%, gray = stale/no data
+- Icon text color: normal, green = charging, red = ≤20%, gray = stale/no data. Normal is
+  white on a dark taskbar and near-black on a light one; the icon follows light/dark mode
+- Digits are drawn at the tray's real pixel size with the same font and smoothing as the
+  taskbar clock
 - Tooltip shows model name, percentage, charging state, polling rate, and battery voltage (Pulsar only)
-- Left-click = refresh now; right-click = menu with **Refresh**, **Polling rate**, **Start with Windows**, **Exit**
+- Left-click = refresh now; right-click = menu with **Refresh**, **Polling rate**, **Battery icon**,
+  **Start with Windows**, **Exit**
+- **Battery icon** adds a small battery glyph, filled to the charge level, above or below the
+  number (hidden by default)
 - **Polling rate** lists the rates the current link supports with the active one checked;
   picking one writes it to the mouse, the same setting the vendor's web driver changes.
   Pulsar: 125 Hz–1 kHz on cable, up to 8 kHz on the 8K dongle. VAXEE: 500 Hz–4 kHz on the
@@ -85,7 +91,10 @@ mousebatt makes no network connections and collects nothing. It only opens HID
 interfaces whose vendor ID is Pulsar or VAXEE, sends the vendor's battery query,
 and reads the reply. The only thing it ever writes to a mouse is the polling rate you
 pick from the menu. The "Start with Windows" toggle writes one value under
-`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and the **Battery icon** choice is
+saved under `HKCU\Software\mousebatt`. To match the icon to the taskbar it reads the
+colour of a few taskbar pixels next to the notification area each time it polls the
+mouse; nothing else on screen is read.
 
 ## Adding a mouse
 

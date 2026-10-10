@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Battery icon** submenu in the right-click menu: show a small battery glyph, filled to
+  the charge level, above or below the number, or hide it (the default). The choice is
+  saved under `HKCU\Software\mousebatt`.
+
+### Changed
+- The icon is drawn at the tray's actual size (16 px at 100% scaling, 20/24 px when
+  scaled; the process is now DPI aware) instead of a 32 px bitmap Windows shrinks.
+- Digits are rendered like the taskbar clock: Segoe UI with the system's font smoothing
+  (ClearType by default), blended against the taskbar colour next to the tray.
+- On a light taskbar the icon uses dark colours (Windows light palette) instead of white,
+  and it redraws when switching between light and dark mode.
+
 ## [0.2.0] - 2026-09-12
 
 ### Added
