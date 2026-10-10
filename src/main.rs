@@ -281,8 +281,13 @@ fn start_poll(hwnd: HWND) {
         // The taskbar colour is refreshed only after the result is posted: a
         // screen read can stall (fullscreen transitions, the lock screen) and
         // must never gate the battery read, and a failed read can cost the
-        // colour but not the poll.
-        icon::refresh_taskbar_color();
+        // colour but not the poll. The icon just posted was drawn with the
+        // previous colour, so redraw it if the colour moved.
+        if icon::refresh_taskbar_color() {
+            // SAFETY: WMAPP_REDRAW carries no payload and `wndproc` ignores
+            // both parameters.
+            unsafe { PostMessageW(hwnd_addr as HWND, WMAPP_REDRAW, 0, 0) };
+        }
     });
 }
 

@@ -306,12 +306,15 @@ const NO_TASKBAR_COLOR: u32 = u32::MAX;
 const LIGHT_TAG: u32 = 1 << 24;
 
 /// Read the taskbar colour off the screen and remember it for `battery_icon`.
-/// Screen reads go through the compositor and can stall, so call this from a
-/// worker thread, never the UI thread.
-pub fn refresh_taskbar_color() {
+/// Returns whether it differs from what was remembered, i.e. whether an icon
+/// drawn before this call is now blended against the wrong colour. Screen
+/// reads go through the compositor and can stall, so call this from a worker
+/// thread, never the UI thread.
+pub fn refresh_taskbar_color() -> bool {
     let light = taskbar_is_light();
     let tag = if light { LIGHT_TAG } else { 0 };
-    TASKBAR_COLOR.store(taskbar_color(light) | tag, Ordering::Relaxed);
+    let new = taskbar_color(light) | tag;
+    TASKBAR_COLOR.swap(new, Ordering::Relaxed) != new
 }
 
 /// The remembered taskbar colour if it was read in the current mode, otherwise
