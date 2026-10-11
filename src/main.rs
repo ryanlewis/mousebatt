@@ -16,7 +16,7 @@ use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
-use icon::{BatteryGlyph, Hicon};
+use icon::{Hicon, IconStyle};
 use protocol::{read_battery, set_polling, BatteryStatus, ReadResult};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -55,8 +55,8 @@ const MENU_AUTOSTART: usize = 2;
 const MENU_EXIT: usize = 3;
 /// Polling-rate items are `MENU_RATE_BASE + index into PollingInfo::rates`.
 const MENU_RATE_BASE: usize = 100;
-/// Battery-icon items are `MENU_GLYPH_BASE + index into BatteryGlyph::ALL`.
-const MENU_GLYPH_BASE: usize = 200;
+/// Icon-style items are `MENU_STYLE_BASE + index into IconStyle::ALL`.
+const MENU_STYLE_BASE: usize = 200;
 
 // Not re-exported cleanly by windows-sys; values are stable Win32 ABI.
 const WM_DEVICECHANGE: u32 = 0x0219;
@@ -78,8 +78,8 @@ thread_local! {
     static CUR_ICON: RefCell<Option<Hicon>> = const { RefCell::new(None) };
     /// What the icon last showed, to redraw it when a display setting changes.
     static LAST_VIEW: RefCell<Option<TrayView>> = const { RefCell::new(None) };
-    /// The user's battery-icon choice; loaded from the registry in `main`.
-    static GLYPH: Cell<BatteryGlyph> = const { Cell::new(DEFAULT_GLYPH) };
+    /// The user's icon-style choice; loaded from the registry in `main`.
+    static STYLE: Cell<IconStyle> = const { Cell::new(DEFAULT_STYLE) };
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -91,7 +91,7 @@ fn main() {
     // at 96 DPI and blurred by Windows' upscaling on scaled displays.
     // SAFETY: no preconditions; called before any window exists.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    GLYPH.with(|g| g.set(load_glyph()));
+    STYLE.with(|s| s.set(load_icon_style()));
     let class_name = wide("mousebatt_tray_wnd");
     // SAFETY: WNDCLASSW is plain data for which all-zero is valid; `class_name`
     // outlives the window (it lives until `main` returns), and the other
@@ -144,7 +144,14 @@ fn main() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
-            update_tray(hwnd, "…", icon::COLOR_STALE, "mousebatt — reading…", true);
+            update_tray(
+                hwnd,
+                None,
+                "…",
+                icon::COLOR_STALE,
+                "mousebatt — reading…",
+                true,
+            );
             // SAFETY: plain handle + id arguments; no callback pointer.
             unsafe { SetTimer(hwnd, TIMER_POLL, POLL_INTERVAL_MS, None) };
             start_poll(hwnd);
@@ -246,7 +253,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         _ => {
             if msg != 0 && msg == TASKBAR_CREATED_MSG.load(Ordering::Relaxed) {
                 // Explorer restarted; re-add our icon.
-                update_tray(hwnd, "…", icon::COLOR_STALE, "mousebatt — reading…", true);
+                update_tray(
+                    hwnd,
+                    None,
+                    "…",
+                    icon::COLOR_STALE,
+                    "mousebatt — reading…",
+                    true,
+                );
                 start_poll(hwnd);
                 return 0;
             }
@@ -307,7 +321,7 @@ fn redraw_worker(hwnd: HWND) {
 fn on_poll_done(hwnd: HWND, result: ReadResult) {
     let last_pct = LAST_GOOD.with(|g| g.borrow().as_ref().map(|s| s.percent));
     let view = tray_view(&result, last_pct);
-    update_tray(hwnd, &view.text, view.color, &view.tip, false);
+    update_tray(hwnd, view.percent, &view.text, view.color, &view.tip, false);
     match result {
         ReadResult::Ok(s) => LAST_GOOD.with(|g| *g.borrow_mut() = Some(s)),
         // Forget the last reading so a different mouse plugged in later
@@ -324,6 +338,10 @@ fn on_poll_done(hwnd: HWND, result: ReadResult) {
 /// What the tray should show for a poll result (pure; unit-tested).
 #[derive(Clone)]
 struct TrayView {
+    /// The charge the icon's battery fill reflects; `None` for a placeholder
+    /// ("?" digits, empty battery).
+    percent: Option<u8>,
+    /// The digit string drawn in the digit styles; not used by `GlyphOnly`.
     text: String,
     color: u32,
     tip: String,
@@ -350,6 +368,7 @@ fn tray_view(result: &ReadResult, last_pct: Option<u8>) -> TrayView {
                 tip.push_str(&format!(" · {} Hz", p.hz));
             }
             TrayView {
+                percent: Some(s.percent),
                 text: s.percent.to_string(),
                 color,
                 tip,
@@ -357,17 +376,20 @@ fn tray_view(result: &ReadResult, last_pct: Option<u8>) -> TrayView {
         }
         ReadResult::NoResponse(product) => match last_pct {
             Some(pct) => TrayView {
+                percent: Some(pct),
                 text: pct.to_string(),
                 color: icon::COLOR_STALE,
                 tip: format!("{} — {}% (stale, mouse not responding)", product, pct),
             },
             None => TrayView {
+                percent: None,
                 text: "?".into(),
                 color: icon::COLOR_STALE,
                 tip: format!("{} — not responding (asleep?)", product),
             },
         },
         ReadResult::NoDevice => TrayView {
+            percent: None,
             text: "?".into(),
             color: icon::COLOR_STALE,
             tip: "No supported mouse found".into(),
@@ -384,10 +406,11 @@ fn base_nid(hwnd: HWND) -> NOTIFYICONDATAW {
     nid
 }
 
-fn update_tray(hwnd: HWND, text: &str, color: u32, tip: &str, add: bool) {
-    let new_icon = icon::battery_icon(text, color, GLYPH.with(Cell::get));
+fn update_tray(hwnd: HWND, percent: Option<u8>, text: &str, color: u32, tip: &str, add: bool) {
+    let new_icon = icon::battery_icon(percent, color, STYLE.with(Cell::get));
     LAST_VIEW.with(|v| {
         *v.borrow_mut() = Some(TrayView {
+            percent,
             text: text.into(),
             color,
             tip: tip.into(),
@@ -417,7 +440,7 @@ fn update_tray(hwnd: HWND, text: &str, color: u32, tip: &str, add: bool) {
 /// changed, without waiting for the mouse.
 fn redraw_tray(hwnd: HWND) {
     if let Some(v) = LAST_VIEW.with(|v| v.borrow().clone()) {
-        update_tray(hwnd, &v.text, v.color, &v.tip, false);
+        update_tray(hwnd, v.percent, &v.text, v.color, &v.tip, false);
     }
 }
 
@@ -429,7 +452,7 @@ fn remove_tray(hwnd: HWND) {
 
 fn show_menu(hwnd: HWND) {
     let autostart = autostart_enabled();
-    let glyph = GLYPH.with(Cell::get);
+    let style = STYLE.with(Cell::get);
     let polling = LAST_GOOD.with(|g| g.borrow().as_ref().and_then(|s| s.polling));
     let mut pt = POINT { x: 0, y: 0 };
     // SAFETY: the menu (and the submenu it owns) is created and destroyed
@@ -457,19 +480,19 @@ fn show_menu(hwnd: HWND) {
             AppendMenuW(menu, MF_POPUP, sub as usize, wide("Polling rate").as_ptr());
         }
         let icon_sub = CreatePopupMenu();
-        for (i, g) in BatteryGlyph::ALL.into_iter().enumerate() {
+        for (i, s) in IconStyle::ALL.into_iter().enumerate() {
             AppendMenuW(
                 icon_sub,
-                MF_STRING | if g == glyph { MF_CHECKED } else { 0 },
-                MENU_GLYPH_BASE + i,
-                wide(glyph_label(g)).as_ptr(),
+                MF_STRING | if s == style { MF_CHECKED } else { 0 },
+                MENU_STYLE_BASE + i,
+                wide(style_label(s)).as_ptr(),
             );
         }
         AppendMenuW(
             menu,
             MF_POPUP,
             icon_sub as usize,
-            wide("Battery icon").as_ptr(),
+            wide("Icon style").as_ptr(),
         );
         AppendMenuW(
             menu,
@@ -503,12 +526,12 @@ fn show_menu(hwnd: HWND) {
             unsafe { PostQuitMessage(0) };
         }
         id => {
-            if let Some(&g) = id
-                .checked_sub(MENU_GLYPH_BASE)
-                .and_then(|i| BatteryGlyph::ALL.get(i))
+            if let Some(&s) = id
+                .checked_sub(MENU_STYLE_BASE)
+                .and_then(|i| IconStyle::ALL.get(i))
             {
-                GLYPH.with(|c| c.set(g));
-                save_glyph(g);
+                STYLE.with(|c| c.set(s));
+                save_icon_style(s);
                 redraw_tray(hwnd);
             } else if let Some(&hz) = id
                 .checked_sub(MENU_RATE_BASE)
@@ -521,38 +544,53 @@ fn show_menu(hwnd: HWND) {
     }
 }
 
-fn glyph_label(g: BatteryGlyph) -> &'static str {
-    match g {
-        BatteryGlyph::Hidden => "Hidden",
-        BatteryGlyph::Above => "Above the number",
-        BatteryGlyph::Below => "Below the number",
+fn style_label(s: IconStyle) -> &'static str {
+    match s {
+        IconStyle::Digits => "Digits",
+        IconStyle::DigitsGlyphAbove => "Digits + battery above",
+        IconStyle::DigitsGlyphBelow => "Digits + battery below",
+        IconStyle::GlyphOnly => "Battery only",
     }
 }
 
 const SETTINGS_KEY: &str = "Software\\mousebatt";
+const STYLE_VALUE: &str = "IconStyle";
+/// The pre-style-upgrade value, still read as a fallback so an upgrade keeps
+/// the user's old choice.
 const GLYPH_VALUE: &str = "BatteryGlyph";
 /// Used until the user picks another from the menu: the plain number, as
 /// before the glyph existed.
-const DEFAULT_GLYPH: BatteryGlyph = BatteryGlyph::Hidden;
+const DEFAULT_STYLE: IconStyle = IconStyle::Digits;
 
-/// The REG_DWORD stored for a battery-icon choice.
-fn glyph_setting(g: BatteryGlyph) -> u32 {
-    match g {
-        BatteryGlyph::Hidden => 0,
-        BatteryGlyph::Above => 1,
-        BatteryGlyph::Below => 2,
+/// The REG_DWORD stored for an icon-style choice.
+fn style_to_dword(s: IconStyle) -> u32 {
+    match s {
+        IconStyle::Digits => 0,
+        IconStyle::DigitsGlyphAbove => 1,
+        IconStyle::DigitsGlyphBelow => 2,
+        IconStyle::GlyphOnly => 3,
     }
 }
 
-fn glyph_from_setting(value: u32) -> Option<BatteryGlyph> {
-    BatteryGlyph::ALL
+fn style_from_dword(value: u32) -> Option<IconStyle> {
+    IconStyle::ALL
         .into_iter()
-        .find(|&g| glyph_setting(g) == value)
+        .find(|&s| style_to_dword(s) == value)
 }
 
-/// The saved battery-icon choice, or the default if none (or an unknown one)
-/// is stored.
-fn load_glyph() -> BatteryGlyph {
+/// The legacy `BatteryGlyph` DWORD mapped onto the styles that existed before
+/// the glyph-only variant: Hidden drew digits alone, Above/Below matched.
+fn glyph_dword_to_style(value: u32) -> Option<IconStyle> {
+    match value {
+        0 => Some(IconStyle::Digits),
+        1 => Some(IconStyle::DigitsGlyphAbove),
+        2 => Some(IconStyle::DigitsGlyphBelow),
+        _ => None,
+    }
+}
+
+/// Read a REG_DWORD value, `None` if absent or not a DWORD.
+fn read_dword(value: &str) -> Option<u32> {
     let mut data: u32 = 0;
     let mut size = size_of::<u32>() as u32;
     // SAFETY: the name temporaries live for the full statement, and
@@ -561,29 +599,36 @@ fn load_glyph() -> BatteryGlyph {
         RegGetValueW(
             HKEY_CURRENT_USER,
             wide(SETTINGS_KEY).as_ptr(),
-            wide(GLYPH_VALUE).as_ptr(),
+            wide(value).as_ptr(),
             RRF_RT_REG_DWORD,
             null_mut(),
             &mut data as *mut u32 as *mut c_void,
             &mut size,
         )
     };
-    if rc == 0 {
-        glyph_from_setting(data).unwrap_or(DEFAULT_GLYPH)
-    } else {
-        DEFAULT_GLYPH
-    }
+    (rc == 0).then_some(data)
 }
 
-fn save_glyph(g: BatteryGlyph) {
-    let data = glyph_setting(g);
+/// The saved icon-style choice, or the default. If the new value is missing
+/// or invalid, the legacy `BatteryGlyph` value is mapped as a fallback; the
+/// legacy key is never written or deleted, and the new key is created only
+/// when the user picks a style from the menu.
+fn load_icon_style() -> IconStyle {
+    read_dword(STYLE_VALUE)
+        .and_then(style_from_dword)
+        .or_else(|| read_dword(GLYPH_VALUE).and_then(glyph_dword_to_style))
+        .unwrap_or(DEFAULT_STYLE)
+}
+
+fn save_icon_style(s: IconStyle) {
+    let data = style_to_dword(s);
     // SAFETY: the name temporaries live for the full statement, and `data` is
     // a 4-byte REG_DWORD that is copied. The key is created if missing.
     unsafe {
         RegSetKeyValueW(
             HKEY_CURRENT_USER,
             wide(SETTINGS_KEY).as_ptr(),
-            wide(GLYPH_VALUE).as_ptr(),
+            wide(STYLE_VALUE).as_ptr(),
             REG_DWORD,
             &data as *const u32 as *const c_void,
             size_of::<u32>() as u32,
@@ -737,13 +782,37 @@ mod tests {
     }
 
     #[test]
-    fn glyph_setting_round_trips_and_ignores_unknown_values() {
-        for g in BatteryGlyph::ALL {
-            assert_eq!(glyph_from_setting(glyph_setting(g)), Some(g));
+    fn style_setting_round_trips_and_ignores_unknown_values() {
+        for s in IconStyle::ALL {
+            assert_eq!(style_from_dword(style_to_dword(s)), Some(s));
         }
-        let stored: Vec<u32> = BatteryGlyph::ALL.into_iter().map(glyph_setting).collect();
-        assert_eq!(stored, [0, 1, 2], "stored values must stay stable");
-        assert_eq!(glyph_from_setting(3), None);
+        let stored: Vec<u32> = IconStyle::ALL.into_iter().map(style_to_dword).collect();
+        assert_eq!(stored, [0, 1, 2, 3], "stored values must stay stable");
+        assert_eq!(style_from_dword(4), None);
+        assert_eq!(style_from_dword(0xFFFF_FFFF), None);
+    }
+
+    #[test]
+    fn legacy_glyph_value_maps_to_style() {
+        assert_eq!(glyph_dword_to_style(0), Some(IconStyle::Digits));
+        assert_eq!(glyph_dword_to_style(1), Some(IconStyle::DigitsGlyphAbove));
+        assert_eq!(glyph_dword_to_style(2), Some(IconStyle::DigitsGlyphBelow));
+        assert_eq!(glyph_dword_to_style(3), None);
+        assert_eq!(glyph_dword_to_style(0xFFFF_FFFF), None);
+    }
+
+    #[test]
+    fn tray_view_percent_tracks_result() {
+        assert_eq!(tray_view(&status(85, false, None), None).percent, Some(85));
+        assert_eq!(
+            tray_view(&ReadResult::NoResponse("X3".into()), Some(60)).percent,
+            Some(60)
+        );
+        assert_eq!(
+            tray_view(&ReadResult::NoResponse("X3".into()), None).percent,
+            None
+        );
+        assert_eq!(tray_view(&ReadResult::NoDevice, Some(60)).percent, None);
     }
 
     #[test]
