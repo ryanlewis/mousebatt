@@ -10,6 +10,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
   with a small battery glyph above or below, or the battery glyph alone — a large glyph
   filled to the charge level with no digits. The choice is saved under
   `HKCU\Software\mousebatt`.
+- **About mousebatt** in the right-click menu: shows the version, project link and licence.
 
 ### Changed
 - The icon is drawn at the tray's actual size (16 px at 100% scaling, 20/24 px when

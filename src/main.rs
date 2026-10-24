@@ -34,9 +34,10 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage,
-    CW_USEDEFAULT, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_NONOTIFY, TPM_RETURNCMD,
+    GetCursorPos, GetMessageW, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage,
+    RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, TrackPopupMenu,
+    TranslateMessage, CW_USEDEFAULT, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MF_CHECKED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, WM_APP, WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER,
     WNDCLASSW, WS_OVERLAPPED,
 };
@@ -53,6 +54,7 @@ const TIMER_THEME: usize = 3;
 const MENU_REFRESH: usize = 1;
 const MENU_AUTOSTART: usize = 2;
 const MENU_EXIT: usize = 3;
+const MENU_ABOUT: usize = 4;
 /// Polling-rate items are `MENU_RATE_BASE + index into PollingInfo::rates`.
 const MENU_RATE_BASE: usize = 100;
 /// Icon-style items are `MENU_STYLE_BASE + index into IconStyle::ALL`.
@@ -80,6 +82,9 @@ thread_local! {
     static LAST_VIEW: RefCell<Option<TrayView>> = const { RefCell::new(None) };
     /// The user's icon-style choice; loaded from the registry in `main`.
     static STYLE: Cell<IconStyle> = const { Cell::new(DEFAULT_STYLE) };
+    /// Set while the About box is up. Its modal loop still dispatches tray
+    /// clicks, so this keeps a second right-click from stacking another one.
+    static ABOUT_OPEN: Cell<bool> = const { Cell::new(false) };
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -455,6 +460,7 @@ fn show_menu(hwnd: HWND) {
     let autostart = autostart_enabled();
     let style = STYLE.with(Cell::get);
     let polling = LAST_GOOD.with(|g| g.borrow().as_ref().and_then(|s| s.polling));
+    let about_open = ABOUT_OPEN.with(Cell::get);
     let mut pt = POINT { x: 0, y: 0 };
     // SAFETY: the menu (and the submenu it owns) is created and destroyed
     // within this block; every string temporary lives for the full statement
@@ -502,6 +508,12 @@ fn show_menu(hwnd: HWND) {
             wide("Start with Windows").as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(
+            menu,
+            MF_STRING | if about_open { MF_GRAYED } else { 0 },
+            MENU_ABOUT,
+            wide("About mousebatt").as_ptr(),
+        );
         AppendMenuW(menu, MF_STRING, MENU_EXIT, wide("Exit").as_ptr());
 
         GetCursorPos(&mut pt);
@@ -521,6 +533,7 @@ fn show_menu(hwnd: HWND) {
     match cmd as usize {
         MENU_REFRESH => start_poll(hwnd),
         MENU_AUTOSTART => set_autostart(!autostart),
+        MENU_ABOUT => show_about(hwnd),
         MENU_EXIT => {
             remove_tray(hwnd);
             // SAFETY: no preconditions.
@@ -543,6 +556,32 @@ fn show_menu(hwnd: HWND) {
             }
         }
     }
+}
+
+fn about_text() -> String {
+    format!(
+        "mousebatt {}\n{}\n\n{}\n\n{} License",
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_DESCRIPTION"),
+        env!("CARGO_PKG_REPOSITORY"),
+        env!("CARGO_PKG_LICENSE"),
+    )
+}
+
+fn show_about(hwnd: HWND) {
+    if ABOUT_OPEN.with(|o| o.replace(true)) {
+        return;
+    }
+    // SAFETY: both string temporaries live for the full call.
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            wide(&about_text()).as_ptr(),
+            wide("About mousebatt").as_ptr(),
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+        );
+    }
+    ABOUT_OPEN.with(|o| o.set(false));
 }
 
 fn style_label(s: IconStyle) -> &'static str {
@@ -730,6 +769,13 @@ fn set_autostart(enable: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn about_text_has_version_and_repo() {
+        let t = about_text();
+        assert!(t.starts_with(&format!("mousebatt {}\n", env!("CARGO_PKG_VERSION"))));
+        assert!(t.contains("https://github.com/ryanlewis/mousebatt"));
+    }
 
     fn status(percent: u8, charging: bool, mv: Option<u16>) -> ReadResult {
         ReadResult::Ok(BatteryStatus {
