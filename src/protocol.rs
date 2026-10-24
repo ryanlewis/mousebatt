@@ -13,6 +13,21 @@
 //!   Register map from packerlschupfer/pulsar-mouse-linux; verified on an
 //!   X3 LHD CrazyLight (wired and 8K Dongle Gen.2).
 //!
+//! Pulsar XS-1 (X2A v3 / X3 family; Pulsar Fusion; notes from
+//! santoshpanna/Pulsar-X3-Web-Config and pulsar-mouse-linux):
+//!   unnumbered 64-byte FEATURE reports on the `0xffff:0x01` collection of
+//!   interface 3 (interface 2 has the same descriptor but never answers).
+//!   `<status> <cat> <reg> <sub> 0 0 <profile> <data…> … <ck lo> <ck hi>`,
+//!   status 0 = request / 1 = answer / 2 = pending, reg bit 7 = read,
+//!   ck = 16-bit LE sum of bytes 0..62. Over a dongle every request is a radio
+//!   round trip: GET_REPORT keeps returning the pending echo until the mouse
+//!   answers, and forever while it sleeps.
+//!     08 81 01 -> [6] = battery %, `ff` with no mouse; 08 83 01 -> [6] = charging.
+//!     01 89 02 -> [7] = polling bitmask 0x01 = 125 Hz … 0x40 = 8 kHz;
+//!     01 09 02 with that byte at [7] sets it.
+//!   Verified on an X2A v3 eS Mini, wired (PID 0x3408) and on its 8K dongle
+//!   (PID 0x5403).
+//!
 //! VAXEE (4K dongle; battery from stuffz/mouse-battery-monitor, the rest from
 //! the VAXEE Control Center web driver at vcc.vaxee.co):
 //!   64-byte FEATURE reports `0E A5 <cmd> <rw> <len> <data…>`, rw 1 = read,
@@ -61,6 +76,10 @@ pub fn read_battery() -> ReadResult {
     if let Some(info) = find_pulsar(&devices) {
         return pulsar_read(&with_vendor("Pulsar", info));
     }
+    let xs1 = find_xs1(&devices);
+    if !xs1.is_empty() {
+        return xs1_read(&xs1);
+    }
     if let Some(info) = find_vaxee(&devices) {
         return vaxee_read(&with_vendor("VAXEE", info));
     }
@@ -75,6 +94,10 @@ pub fn set_polling(hz: u16) -> bool {
     if let Some(info) = find_pulsar(&devices) {
         return set_pulsar_polling(info, hz);
     }
+    let xs1 = find_xs1(&devices);
+    if !xs1.is_empty() {
+        return set_xs1_polling(&xs1, hz);
+    }
     if let Some(info) = find_vaxee(&devices) {
         return set_vaxee_polling(info, hz);
     }
@@ -85,6 +108,23 @@ fn find_pulsar(devices: &[HidDeviceInfo]) -> Option<&HidDeviceInfo> {
     devices
         .iter()
         .find(|d| d.vid == PULSAR_VID && d.usage_page == 0xff02)
+}
+
+/// Pulsar XS-1 control collections, interface 3 first: interfaces 2 and 3
+/// share a descriptor and only the path tells them apart.
+fn find_xs1(devices: &[HidDeviceInfo]) -> Vec<&HidDeviceInfo> {
+    let mut found: Vec<_> = devices
+        .iter()
+        .filter(|d| d.vid == PULSAR_VID && d.usage_page == 0xffff && d.usage == 0x0001)
+        .collect();
+    found.sort_by_key(|d| !is_interface_3(&d.path));
+    found
+}
+
+fn is_interface_3(path: &[u16]) -> bool {
+    String::from_utf16_lossy(path)
+        .to_ascii_lowercase()
+        .contains("&mi_03")
 }
 
 fn find_vaxee(devices: &[HidDeviceInfo]) -> Option<&HidDeviceInfo> {
@@ -226,6 +266,68 @@ fn vaxee_xact(dev: &HidDevice, req: &[u8]) -> Option<Vec<u8>> {
     vaxee_valid(dev.get_feature(VAXEE_REPORT_ID)?)
 }
 
+/// Read a Pulsar XS-1 mouse through the first candidate collection that
+/// answers (interface 2 refuses the feature write outright, so it costs little).
+fn xs1_read(candidates: &[&HidDeviceInfo]) -> ReadResult {
+    let product = with_vendor("Pulsar", candidates[0]).product;
+    for info in candidates {
+        let Some(dev) = HidDevice::open(info) else {
+            continue;
+        };
+        let query = |cmd: [u8; 3]| xs1_xact(&dev, cmd, &[]);
+        let Some(bat) = query(XS1_CMD_BATTERY) else {
+            continue;
+        };
+        let Some(mut status) =
+            query(XS1_CMD_CHARGING).and_then(|chg| parse_xs1(&bat, &chg, &product))
+        else {
+            continue;
+        };
+        // Best effort: the tray still works without it.
+        status.polling = query(XS1_CMD_POLLING).and_then(|r| parse_xs1_polling(&r, info.pid));
+        return ReadResult::Ok(status);
+    }
+    ReadResult::NoResponse(product)
+}
+
+/// Send one XS-1 request and poll the feature buffer for its answer. A
+/// dongle reports "pending" until the mouse replies over the radio (~15-250 ms);
+/// a sleeping mouse never does, so give up at the deadline. Resending would
+/// only restart the round trip.
+fn xs1_xact(dev: &HidDevice, cmd: [u8; 3], data: &[u8]) -> Option<Vec<u8>> {
+    if !dev.set_feature(&xs1_request(cmd, data)) {
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_millis(1000);
+    loop {
+        std::thread::sleep(Duration::from_millis(20));
+        let resp = dev.get_feature(XS1_REPORT_ID)?;
+        if xs1_payload(&resp, cmd).is_some() {
+            return Some(resp);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
+/// Write `hz` to a Pulsar XS-1 mouse. A read straight after the write can
+/// still return the old rate, so let it settle before the caller re-reads.
+fn set_xs1_polling(candidates: &[&HidDeviceInfo], hz: u16) -> bool {
+    let Some(bit) = xs1_rate_bit(hz) else {
+        return false;
+    };
+    let acked = candidates.iter().any(|info| {
+        HidDevice::open(info)
+            .and_then(|dev| xs1_xact(&dev, XS1_CMD_SET_POLLING, &[bit]))
+            .is_some_and(|resp| xs1_set_acked(&resp, bit))
+    });
+    if acked {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    acked
+}
+
 // ---------------------------------------------------------------------------
 // Pure framing/parsing — no HID access, covered by unit tests below.
 
@@ -237,6 +339,20 @@ const PULSAR_CMD_MEM_GET: u8 = 0x08;
 /// Frame checksum complement; also used for the `(v, 0x55 - v)` setting pairs.
 const PULSAR_MAGIC: u8 = 0x55;
 const PULSAR_ADDR_POLLING: u16 = 0x0000;
+
+/// Unnumbered report: Windows still puts the (zero) ID in byte 0, so the
+/// 64-byte frame sits at buffer offset 1.
+const XS1_REPORT_ID: u8 = 0x00;
+const XS1_FRAME_LEN: usize = 64;
+const XS1_STATUS_ANSWER: u8 = 0x01;
+/// `[category, register, sub-register]`; register bit 7 = read.
+const XS1_CMD_BATTERY: [u8; 3] = [0x08, 0x81, 0x01];
+const XS1_CMD_CHARGING: [u8; 3] = [0x08, 0x83, 0x01];
+const XS1_CMD_POLLING: [u8; 3] = [0x01, 0x89, 0x02];
+const XS1_CMD_SET_POLLING: [u8; 3] = [0x01, 0x09, 0x02];
+/// Links that carry 8 kHz: the 8K dongle and the X2A v3 Mini on its cable.
+/// Anything else (1K dongle 0x5402, other cabled mice) is treated as 1 kHz.
+const XS1_8K_PIDS: [u16; 2] = [0x5403, 0x3408];
 
 const VAXEE_REPORT_ID: u8 = 0x0e;
 const VAXEE_HEADER: u8 = 0xa5;
@@ -351,6 +467,88 @@ fn parse_pulsar(resp: &[u8], product: &str) -> Option<BatteryStatus> {
         product: product.to_string(),
         polling: None,
     })
+}
+
+fn xs1_checksum(frame: &[u8]) -> [u8; 2] {
+    let sum = frame[..XS1_FRAME_LEN - 2]
+        .iter()
+        .fold(0u16, |acc, &b| acc.wrapping_add(b as u16));
+    sum.to_le_bytes()
+}
+
+/// Build an XS-1 feature buffer: report ID, then the 64-byte frame with
+/// `cmd` at 1..4, profile 0 (active), `data` from frame byte 7, checksum last.
+fn xs1_request(cmd: [u8; 3], data: &[u8]) -> [u8; 1 + XS1_FRAME_LEN] {
+    let mut buf = [0u8; 1 + XS1_FRAME_LEN];
+    buf[0] = XS1_REPORT_ID;
+    let frame = &mut buf[1..];
+    frame[1..4].copy_from_slice(&cmd);
+    frame[7..7 + data.len()].copy_from_slice(data);
+    let ck = xs1_checksum(frame);
+    frame[XS1_FRAME_LEN - 2..].copy_from_slice(&ck);
+    buf
+}
+
+/// The 64-byte frame of a feature buffer, if it is a checksummed answer to
+/// `cmd`'s category and register. The sub-register isn't reliably echoed,
+/// and a pending reply is the request echoed with status 2.
+fn xs1_payload(resp: &[u8], cmd: [u8; 3]) -> Option<&[u8]> {
+    let frame = resp.get(1..1 + XS1_FRAME_LEN)?;
+    (frame[0] == XS1_STATUS_ANSWER
+        && frame[1..3] == cmd[..2]
+        && frame[XS1_FRAME_LEN - 2..] == xs1_checksum(frame))
+    .then_some(frame)
+}
+
+/// Combine battery and charging answers. `None` if the dongle has no mouse
+/// (battery reads `ff`) or either buffer isn't a matching answer.
+fn parse_xs1(bat: &[u8], chg: &[u8], product: &str) -> Option<BatteryStatus> {
+    let bat = xs1_payload(bat, XS1_CMD_BATTERY)?;
+    let chg = xs1_payload(chg, XS1_CMD_CHARGING)?;
+    if bat[6] > 100 {
+        return None;
+    }
+    Some(BatteryStatus {
+        percent: bat[6],
+        charging: chg[6] != 0,
+        voltage_mv: None,
+        product: product.to_string(),
+        polling: None,
+    })
+}
+
+/// Polling bitmask: one bit per rate, 0x01 = 125 Hz up to 0x40 = 8 kHz.
+fn xs1_rate_bit(hz: u16) -> Option<u8> {
+    PULSAR_RATES.iter().position(|&r| r == hz).map(|i| 1 << i)
+}
+
+fn xs1_bit_rate(bit: u8) -> Option<u16> {
+    if bit.count_ones() != 1 {
+        return None;
+    }
+    PULSAR_RATES.get(bit.trailing_zeros() as usize).copied()
+}
+
+/// Current rate from a polling answer; the ceiling comes from the USB PID.
+fn parse_xs1_polling(resp: &[u8], pid: u16) -> Option<PollingInfo> {
+    let frame = xs1_payload(resp, XS1_CMD_POLLING)?;
+    let hz = xs1_bit_rate(frame[7])?;
+    let max_hz = if XS1_8K_PIDS.contains(&pid) {
+        8000
+    } else {
+        1000
+    };
+    Some(PollingInfo {
+        hz,
+        // Never hide the rate the mouse is actually on.
+        max_hz: max_hz.max(hz),
+        rates: &PULSAR_RATES,
+    })
+}
+
+/// A rate write is answered by echoing it at frame byte 7.
+fn xs1_set_acked(resp: &[u8], bit: u8) -> bool {
+    xs1_payload(resp, XS1_CMD_SET_POLLING).is_some_and(|frame| frame[7] == bit)
 }
 
 /// 5-byte VAXEE feature request: report ID, header, cmd, read, length.
@@ -594,6 +792,129 @@ mod tests {
         let mut junk_tail = req;
         junk_tail[16] = 0;
         assert!(pulsar_set_acked(&req, &junk_tail));
+    }
+
+    /// A 65-byte XS-1 feature buffer: report ID 0, the frame's leading bytes,
+    /// and the checksum as captured.
+    fn xs1_buf(head: &[u8], ck: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; 65];
+        buf[1..1 + head.len()].copy_from_slice(head);
+        buf[63..].copy_from_slice(&ck.to_le_bytes());
+        buf
+    }
+
+    fn xs1_8k_battery() -> Vec<u8> {
+        // Captured over the 8K dongle: `01 08 81 01 00 00 62 00*55 ed 00` = 98 %.
+        xs1_buf(&[0x01, 0x08, 0x81, 0x01, 0, 0, 0x62], 0xed)
+    }
+
+    fn xs1_8k_charging(on: bool) -> Vec<u8> {
+        // Captured: `01 08 83 01 00 00 00 … 8d 00` (wired it read 01).
+        xs1_buf(&[0x01, 0x08, 0x83, 0x01, 0, 0, on as u8], 0x8d + on as u16)
+    }
+
+    #[test]
+    fn xs1_request_frame() {
+        // Captured: `00 | 00 08 81 01 00*58 8a 00`.
+        let r = xs1_request(XS1_CMD_BATTERY, &[]);
+        assert_eq!(r.len(), 65);
+        assert_eq!(&r[..5], &[0x00, 0x00, 0x08, 0x81, 0x01]);
+        assert!(r[5..63].iter().all(|&b| b == 0));
+        assert_eq!(&r[63..], &[0x8a, 0x00]);
+        // Data starts at frame byte 7: `00 01 09 02 00 00 00 08 … 14 00`.
+        let w = xs1_request(XS1_CMD_SET_POLLING, &[0x08]);
+        assert_eq!(&w[1..9], &[0x00, 0x01, 0x09, 0x02, 0, 0, 0, 0x08]);
+        assert_eq!(&w[63..], &[0x14, 0x00]);
+    }
+
+    #[test]
+    fn xs1_checksum_is_16_bit() {
+        let r = xs1_request(XS1_CMD_SET_POLLING, &[0xff; 50]);
+        let sum: u16 = 0x01 + 0x09 + 0x02 + 50 * 0xff;
+        assert_eq!(&r[63..], &sum.to_le_bytes());
+    }
+
+    #[test]
+    fn xs1_parses_dongle_battery() {
+        let s = parse_xs1(&xs1_8k_battery(), &xs1_8k_charging(false), "Pulsar").unwrap();
+        assert_eq!(s.percent, 98);
+        assert!(!s.charging);
+        assert_eq!(s.voltage_mv, None);
+        assert_eq!(s.polling, None);
+        assert!(
+            parse_xs1(&xs1_8k_battery(), &xs1_8k_charging(true), "Pulsar")
+                .unwrap()
+                .charging
+        );
+    }
+
+    #[test]
+    fn xs1_rejects_pending_and_mismatched_replies() {
+        // Pending: the request echoed with status 2 and its own checksum.
+        let pending = xs1_buf(&[0x02, 0x08, 0x81, 0x01], 0x8a);
+        assert!(xs1_payload(&pending, XS1_CMD_BATTERY).is_none());
+        // Answer to a different register, bad checksum, short buffer.
+        assert!(xs1_payload(&xs1_8k_charging(false), XS1_CMD_BATTERY).is_none());
+        let mut bad_ck = xs1_8k_battery();
+        bad_ck[63] ^= 1;
+        assert!(xs1_payload(&bad_ck, XS1_CMD_BATTERY).is_none());
+        assert!(xs1_payload(&xs1_8k_battery()[..64], XS1_CMD_BATTERY).is_none());
+        // Swapped arguments and a dongle with no mouse (`ff`).
+        assert!(parse_xs1(&xs1_8k_charging(false), &xs1_8k_battery(), "P").is_none());
+        let no_mouse = xs1_buf(&[0x01, 0x08, 0x81, 0x01, 0, 0, 0xff], 0x018a);
+        assert!(parse_xs1(&no_mouse, &xs1_8k_charging(false), "P").is_none());
+    }
+
+    #[test]
+    fn xs1_rate_bits_round_trip() {
+        for hz in PULSAR_RATES {
+            assert_eq!(xs1_bit_rate(xs1_rate_bit(hz).unwrap()), Some(hz));
+        }
+        assert_eq!(xs1_rate_bit(125), Some(0x01));
+        assert_eq!(xs1_rate_bit(2000), Some(0x10));
+        assert_eq!(xs1_rate_bit(8000), Some(0x40));
+        assert_eq!(xs1_rate_bit(3000), None);
+        assert_eq!(xs1_bit_rate(0x00), None);
+        assert_eq!(xs1_bit_rate(0x18), None);
+        assert_eq!(xs1_bit_rate(0x80), None);
+    }
+
+    #[test]
+    fn xs1_polling_and_ceiling() {
+        // Captured over the 8K dongle: `01 01 89 02 00 00 00 10 … 9d 00` = 2 kHz.
+        let reply = xs1_buf(&[0x01, 0x01, 0x89, 0x02, 0, 0, 0, 0x10], 0x9d);
+        let p = parse_xs1_polling(&reply, 0x5403).unwrap();
+        assert_eq!((p.hz, p.max_hz), (2000, 8000));
+        assert_eq!(p.rates, &PULSAR_RATES);
+        assert_eq!(parse_xs1_polling(&reply, 0x3408).unwrap().max_hz, 8000);
+        // The 1K dongle caps at 1 kHz but never hides the current rate.
+        assert_eq!(parse_xs1_polling(&reply, 0x5402).unwrap().max_hz, 2000);
+        let k1 = xs1_buf(&[0x01, 0x01, 0x89, 0x02, 0, 0, 0, 0x04], 0x91);
+        let p = parse_xs1_polling(&k1, 0x5402).unwrap();
+        assert_eq!((p.hz, p.max_hz), (500, 1000));
+        assert!(parse_xs1_polling(&xs1_8k_battery(), 0x5403).is_none());
+    }
+
+    #[test]
+    fn xs1_set_ack_requires_echoed_rate() {
+        // Captured: `01 01 09 02 00 00 00 08 …` after writing 1 kHz.
+        let ack = xs1_buf(&[0x01, 0x01, 0x09, 0x02, 0, 0, 0, 0x08], 0x15);
+        assert!(xs1_set_acked(&ack, 0x08));
+        assert!(!xs1_set_acked(&ack, 0x10));
+        // The read answer for the same register is not a write ack.
+        let read = xs1_buf(&[0x01, 0x01, 0x89, 0x02, 0, 0, 0, 0x08], 0x95);
+        assert!(!xs1_set_acked(&read, 0x08));
+    }
+
+    #[test]
+    fn xs1_prefers_interface_3() {
+        let path = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        assert!(is_interface_3(&path(
+            r"\\?\HID#VID_3710&PID_5403&MI_03#b&a05a229&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        )));
+        assert!(!is_interface_3(&path(
+            r"\\?\HID#VID_3710&PID_5403&MI_02#b&21c92e6e&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        )));
     }
 
     #[test]

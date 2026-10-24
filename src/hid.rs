@@ -40,8 +40,8 @@ pub const PULSAR_VID: u16 = 0x3710;
 pub const VAXEE_VID: u16 = 0x3057;
 const VENDOR_IDS: [u16; 2] = [PULSAR_VID, VAXEE_VID];
 
-// `usage` isn't matched on today but is part of the device identity; kept
-// for future vendor entries. `pid` tells VAXEE receivers from cabled mice.
+// `pid` tells receivers from cabled mice; `usage` picks the Pulsar XS-1
+// control collection.
 #[allow(dead_code)]
 pub struct HidDeviceInfo {
     pub path: Vec<u16>, // null-terminated wide string

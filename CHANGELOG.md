@@ -6,6 +6,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 ## [Unreleased]
 
 ### Added
+- Pulsar X2A v3 (XS-1 platform, e.g. the X2A v3 eS Mini) on its cable or 8K dongle:
+  battery, charging state and the **Polling rate** submenu (125 Hz–8 kHz). These mice
+  use a 64-byte feature-report protocol on a different HID collection, so they were
+  not detected before.
 - **Icon style** submenu in the right-click menu: the digits alone (the default), digits
   with a small battery glyph above or below, or the battery glyph alone — a large glyph
   filled to the charge level with no digits. The choice is saved under
