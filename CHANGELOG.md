@@ -6,11 +6,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 ## [Unreleased]
 
 ### Added
-- **Battery icon** submenu in the right-click menu: show a small battery glyph, filled to
-  the charge level, above or below the number, or hide it (the default). The choice is
-  saved under `HKCU\Software\mousebatt`.
+- **Icon style** submenu in the right-click menu (replaces **Battery icon**): the digits
+  alone, digits with a small battery glyph above or below, or the battery glyph alone —
+  a large glyph filled to the charge level with no digits. The choice is saved under
+  `HKCU\Software\mousebatt` as `IconStyle`; on upgrade the old `BatteryGlyph` value is
+  read as a fallback (missing or invalid `IconStyle`), left untouched, and the new value
+  is written only when a style is picked.
 
 ### Changed
+- The submenu previously labelled **Battery icon** is now **Icon style**; its "Hidden",
+  "Above the number" and "Below the number" items are now "Digits", "Digits + battery
+  above" and "Digits + battery below" (same stored values 0–2, so existing choices carry
+  over), plus the new "Battery only" style.
+- The tray icon now reports the battery level to the renderer as a number instead of
+  parsing the drawn text, so the glyph fills correctly with the digits hidden.
 - The icon is drawn at the tray's actual size (16 px at 100% scaling, 20/24 px when
   scaled; the process is now DPI aware) instead of a 32 px bitmap Windows shrinks.
 - Digits are rendered like the taskbar clock: Segoe UI with the system's font smoothing
