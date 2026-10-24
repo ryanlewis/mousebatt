@@ -18,6 +18,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 - On a light taskbar the icon uses dark colours (Windows light palette) instead of white,
   and it redraws when switching between light and dark mode.
 
+### Fixed
+- **Start with Windows** is ticked only when the startup entry launches this exe. After
+  moving or rebuilding mousebatt in another folder it reads as off, and one click points
+  the entry at the new location (previously it stayed ticked on the stale path).
+
 ## [0.2.0] - 2026-09-12
 
 ### Added

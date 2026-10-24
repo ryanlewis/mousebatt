@@ -21,9 +21,9 @@ use protocol::{read_battery, set_polling, BatteryStatus, ReadResult};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
-    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
-    RRF_RT_REG_DWORD,
+    RegCloseKey, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetKeyValueW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD,
+    RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -623,21 +623,52 @@ impl Drop for RegKey {
     }
 }
 
+/// The Run-key command line that launches this exe.
+fn autostart_command() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .map(|exe| format!("\"{}\"", exe.display()))
+}
+
+/// Whether a stored Run-key command launches `command`. Quotes are optional
+/// and paths are case-insensitive on Windows.
+fn is_same_command(stored: &str, command: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_matches('"').to_lowercase();
+    norm(stored) == norm(command)
+}
+
+/// Ticked only when the Run value launches *this* exe. An entry left behind
+/// by a copy elsewhere (moved or rebuilt in another folder) reads as off, so
+/// one click rewrites it to the current path.
 fn autostart_enabled() -> bool {
+    let Some(command) = autostart_command() else {
+        return false;
+    };
     let Some(key) = RegKey::open_run(KEY_QUERY_VALUE) else {
         return false;
     };
-    // SAFETY: all-null out-pointers are permitted (existence check only).
-    unsafe {
-        RegQueryValueExW(
+    let mut buf = [0u16; 1024];
+    let mut size = size_of_val(&buf) as u32;
+    // SAFETY: the name temporary lives for the full statement, and
+    // `buf`/`size` describe a writable buffer of `size` bytes. RRF_RT_REG_SZ
+    // NUL-terminates the result; an over-long value fails rather than
+    // truncating.
+    let rc = unsafe {
+        RegGetValueW(
             key.0,
+            null(),
             wide(RUN_VALUE).as_ptr(),
+            RRF_RT_REG_SZ,
             null_mut(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-        ) == 0
+            buf.as_mut_ptr() as *mut c_void,
+            &mut size,
+        )
+    };
+    if rc != 0 {
+        return false;
     }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    is_same_command(&String::from_utf16_lossy(&buf[..len]), &command)
 }
 
 fn set_autostart(enable: bool) {
@@ -645,8 +676,8 @@ fn set_autostart(enable: bool) {
         return;
     };
     if enable {
-        if let Ok(exe) = std::env::current_exe() {
-            let value = wide(&format!("\"{}\"", exe.display()));
+        if let Some(command) = autostart_command() {
+            let value = wide(&command);
             // SAFETY: `value` is a NUL-terminated wide string and the byte
             // length passed (u16 count * 2) covers it including the terminator,
             // as REG_SZ requires.
@@ -692,6 +723,24 @@ mod tests {
             });
         }
         assert_eq!(tray_view(&r, None).tip, "X3 — 85% · 3.91 V · 4000 Hz");
+    }
+
+    #[test]
+    fn autostart_matches_same_exe() {
+        let cmd = r#""C:\dev\mousebatt\target\release\mousebatt.exe""#;
+        assert!(is_same_command(cmd, cmd));
+        assert!(is_same_command(
+            r"c:\DEV\mousebatt\target\release\MOUSEBATT.exe",
+            cmd
+        ));
+    }
+
+    #[test]
+    fn autostart_rejects_other_location() {
+        assert!(!is_same_command(
+            r#""D:\dev\mousebatt\target\release\mousebatt.exe""#,
+            r#""C:\dev\mousebatt\target\release\mousebatt.exe""#
+        ));
     }
 
     #[test]
