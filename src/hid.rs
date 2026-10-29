@@ -131,7 +131,7 @@ fn probe(wpath: Vec<u16>) -> Option<HidDeviceInfo> {
     let attrs = unsafe {
         let mut attrs: HIDD_ATTRIBUTES = zeroed();
         attrs.Size = size_of::<HIDD_ATTRIBUTES>() as u32;
-        if HidD_GetAttributes(h.0, &mut attrs) == 0 {
+        if !HidD_GetAttributes(h.0, &mut attrs) {
             return None;
         }
         attrs
@@ -145,7 +145,7 @@ fn probe(wpath: Vec<u16>) -> Option<HidDeviceInfo> {
     let caps = unsafe {
         let mut caps: HIDP_CAPS = zeroed();
         let mut preparsed: isize = 0;
-        if HidD_GetPreparsedData(h.0, &mut preparsed) == 0 {
+        if !HidD_GetPreparsedData(h.0, &mut preparsed) {
             return None;
         }
         let ok = HidP_GetCaps(preparsed, &mut caps) == HIDP_STATUS_SUCCESS;
@@ -164,7 +164,7 @@ fn probe(wpath: Vec<u16>) -> Option<HidDeviceInfo> {
             h.0,
             name_buf.as_mut_ptr() as *mut c_void,
             (name_buf.len() * 2) as u32,
-        ) != 0
+        )
     };
     let product = if got_name {
         let n = name_buf
@@ -331,7 +331,7 @@ impl HidDevice {
                 self.handle.0,
                 buf.as_ptr() as *const c_void,
                 buf.len() as u32,
-            ) != 0
+            )
         }
     }
 
@@ -348,7 +348,7 @@ impl HidDevice {
                 self.handle.0,
                 buf.as_mut_ptr() as *mut c_void,
                 buf.len() as u32,
-            ) != 0
+            )
         };
         ok.then_some(buf)
     }
